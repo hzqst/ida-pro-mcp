@@ -86,6 +86,11 @@ PARTIAL_DATABASE_EXTENSIONS = (".id0", ".id1", ".id2", ".nam", ".til")
 # RPC waiting on it) forever, with no progress feedback and no recovery.
 # Set IDA_MCP_OPEN_TIMEOUT=0 to wait indefinitely (previous behavior).
 WORKER_OPEN_TIMEOUT_SEC = float(os.environ.get("IDA_MCP_OPEN_TIMEOUT", "1800"))
+# Default idle TTL (seconds) before a headless idalib worker self-exits when no
+# request has arrived. Override globally with IDA_MCP_IDLE_TTL_SEC, or per-session
+# via idb_open(idle_ttl_sec=...). Note the worker clamps to a minimum (see
+# worker_lifecycle.set_idle_ttl), so 0 here does NOT mean "never exit".
+WORKER_IDLE_TTL_SEC = int(_env_float("IDA_MCP_IDLE_TTL_SEC", 600.0))
 
 
 def _import_zeromcp():
@@ -816,7 +821,7 @@ class IdalibSupervisor:
         run_auto_analysis: bool = True,
         build_caches: bool = True,
         init_hexrays: bool = True,
-        idle_ttl_sec: int = 600,
+        idle_ttl_sec: int = WORKER_IDLE_TTL_SEC,
         session_id: str | None = None,
     ) -> WorkerSession:
         if mode not in IDB_OPEN_MODES:
@@ -1293,8 +1298,9 @@ def idb_open(
     init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler after open"] = True,
     idle_ttl_sec: Annotated[
         int,
-        "Minimum idle TTL in seconds before the headless worker self-exits.",
-    ] = 600,
+        "Minimum idle TTL in seconds before the headless worker self-exits "
+        "(default IDA_MCP_IDLE_TTL_SEC, else 600).",
+    ] = WORKER_IDLE_TTL_SEC,
     preferred_session_id: Annotated[
         str, "Preferred session ID (auto-generated if empty). Ignored if the file is already open in a GUI or worker session."
     ] = "",

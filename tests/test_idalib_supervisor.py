@@ -588,7 +588,7 @@ def test_open_session_defaults_idle_ttl_sec_to_baseline(tmp_path):
     sup = _FakeSupervisor()
     sup.open_session(str(sample), session_id="sample")
     args = sup.opened[0][1]
-    assert args["idle_ttl_sec"] == 600
+    assert args["idle_ttl_sec"] == supmod.WORKER_IDLE_TTL_SEC
 
 
 def test_open_session_skips_warmup_when_flags_disabled(tmp_path):

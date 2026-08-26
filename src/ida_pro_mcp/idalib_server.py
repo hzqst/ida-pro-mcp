@@ -60,7 +60,21 @@ IDB_MANAGEMENT_TOOLS = {
 }
 
 
-_LIFECYCLE = WorkerLifecycle()
+def _env_idle_ttl_sec() -> int:
+    """Default idle TTL (seconds) for this worker, from IDA_MCP_IDLE_TTL_SEC.
+
+    Falls back to 600 if the variable is unset or invalid. The supervisor
+    forwards an explicit per-session idle_ttl_sec on every idb_open, so this
+    only governs the watchdog before the first open (and direct worker usage).
+    """
+    try:
+        return int(float(os.environ.get("IDA_MCP_IDLE_TTL_SEC", "").strip() or 600))
+    except ValueError:
+        return 600
+
+
+_DEFAULT_IDLE_TTL_SEC = _env_idle_ttl_sec()
+_LIFECYCLE = WorkerLifecycle(idle_ttl_sec=_DEFAULT_IDLE_TTL_SEC)
 _PUMP = get_pump()
 _REGISTERED_PORT: int | None = None
 _BOUND_HOST: str = ""
@@ -103,8 +117,9 @@ def idb_open(
     init_hexrays: Annotated[bool, "Initialize Hex-Rays decompiler after open"] = True,
     idle_ttl_sec: Annotated[
         int,
-        "Minimum idle TTL in seconds before the headless worker self-exits.",
-    ] = 600,
+        "Minimum idle TTL in seconds before the headless worker self-exits "
+        "(default IDA_MCP_IDLE_TTL_SEC, else 600).",
+    ] = _DEFAULT_IDLE_TTL_SEC,
     preferred_session_id: Annotated[
         str,
         "Preferred session ID (auto-generated if empty). Ignored if the file is already open.",
