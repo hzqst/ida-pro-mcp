@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from ida_pro_mcp import idalib_supervisor as supmod
+from ida_pro_mcp import worker_rpc_pool as poolmod
 
 
 class _FakeProcess:
@@ -135,12 +136,14 @@ def test_worker_rpc_default_has_no_socket_timeout(monkeypatch):
     class _FakeResponse:
         status = 200
         reason = "OK"
+        will_close = False
 
         def read(self):
             return b'{"jsonrpc":"2.0","result":{"ok":true},"id":1}'
 
     class _FakeConnection:
         instances = []
+        sock = None
 
         def __init__(self, host, port, timeout=None):
             self.host = host
@@ -157,7 +160,7 @@ def test_worker_rpc_default_has_no_socket_timeout(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(supmod.http.client, "HTTPConnection", _FakeConnection)
+    monkeypatch.setattr(poolmod.http.client, "HTTPConnection", _FakeConnection)
     sup = supmod.IdalibSupervisor(supmod.McpServer("test"))
     worker = supmod.WorkerSession(
         session_id="worker",
@@ -172,7 +175,7 @@ def test_worker_rpc_default_has_no_socket_timeout(monkeypatch):
     sup._worker_rpc(worker, {"jsonrpc": "2.0", "id": 2, "method": "ping"}, timeout=2.0)
 
     assert _FakeConnection.instances[0].timeout is None
-    assert _FakeConnection.instances[1].timeout == 2.0
+    assert 0 < _FakeConnection.instances[1].timeout <= 2.0
 
 
 def test_cleanup_partial_database_removes_only_new_parts(tmp_path):
@@ -629,8 +632,10 @@ def test_open_session_reuses_schema_worker(tmp_path):
     sample.write_bytes(b"x")
     sup = _FakeSupervisor()
     sup.worker_tools()  # creates the idle/schema worker
+    schema_pool = sup._schema_worker.rpc_pool
     session = sup.open_session(str(sample), session_id="sample")
     assert session.session_id == "sample"
+    assert session.rpc_pool is schema_pool
     assert sup.opened[0][1]["preferred_session_id"] == "sample"
 
 
