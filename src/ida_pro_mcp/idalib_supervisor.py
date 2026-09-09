@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import http.client
 import importlib.util
 import json
 import logging
@@ -25,6 +24,8 @@ from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from typing import Annotated, Any, TypedDict
+
+from .worker_rpc_pool import WorkerRpcPool
 
 
 logger = logging.getLogger(__name__)
@@ -194,6 +195,7 @@ class WorkerSession:
     pid: int | None = None
     last_warmup: dict[str, Any] | None = None
     unresponsive_since: float | None = None
+    rpc_pool: WorkerRpcPool = field(default_factory=WorkerRpcPool, repr=False, compare=False)
 
     def to_dict(self) -> IdalibSessionInfo:
         return {
@@ -317,6 +319,7 @@ class IdalibSupervisor:
         raise TimeoutError(f"idalib worker did not become ready: {last_error}")
 
     def _terminate_worker(self, worker: WorkerSession) -> None:
+        worker.rpc_pool.close()
         if worker.backend != "worker" or not worker.owned:
             return
         proc = worker.process
@@ -380,6 +383,8 @@ class IdalibSupervisor:
         """
         with self._lock:
             schema = self._schema_worker
+            for session in self.sessions.values():
+                session.rpc_pool.close()
             self.sessions.clear()
             self.path_to_session.clear()
             self._schema_worker = None
@@ -393,6 +398,8 @@ class IdalibSupervisor:
                     return worker
             if self._schema_worker is not None and self._schema_worker.is_alive():
                 return self._schema_worker
+            if self._schema_worker is not None:
+                self._schema_worker.rpc_pool.close()
             self._schema_worker = self._spawn_worker()
             return self._schema_worker
 
@@ -401,6 +408,8 @@ class IdalibSupervisor:
             worker = self._schema_worker
             self._schema_worker = None
             return worker
+        if self._schema_worker is not None:
+            self._schema_worker.rpc_pool.close()
         self._schema_worker = None
         return None
 
@@ -452,7 +461,8 @@ class IdalibSupervisor:
         timeout: float | None = None,
     ) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
-        conn = http.client.HTTPConnection(worker.host, worker.port, timeout=timeout)
+        conn = worker.rpc_pool.acquire(worker.host, worker.port, timeout=timeout)
+        reusable = False
         try:
             conn.request(
                 "POST",
@@ -467,9 +477,11 @@ class IdalibSupervisor:
             raw = response.read().decode("utf-8")
             if response.status >= 400:
                 raise RuntimeError(f"HTTP {response.status} {response.reason}: {raw}")
-            return json.loads(raw)
+            result = json.loads(raw)
+            reusable = not response.will_close
+            return result
         finally:
-            conn.close()
+            worker.rpc_pool.release(conn, reusable=reusable)
 
     def call_worker_tool(
         self,
@@ -556,6 +568,9 @@ class IdalibSupervisor:
         return matches[0] if matches else None
 
     def _register_session_locked(self, session: WorkerSession, resolved_path: str) -> None:
+        previous = self.sessions.get(session.session_id)
+        if previous is not None and previous.rpc_pool is not session.rpc_pool:
+            previous.rpc_pool.close()
         self.sessions[session.session_id] = session
         for candidate in self._candidate_idb_paths(resolved_path):
             self.path_to_session[candidate] = session.session_id
@@ -720,6 +735,8 @@ class IdalibSupervisor:
 
     def _unregister_session_locked(self, session_id: str) -> WorkerSession | None:
         session = self.sessions.pop(session_id, None)
+        if session is not None:
+            session.rpc_pool.close()
         stale_paths = [
             path_key
             for path_key, bound_session_id in self.path_to_session.items()
@@ -768,6 +785,7 @@ class IdalibSupervisor:
             pid=int(instance["pid"]) if instance.get("pid") is not None else None,
         )
         if not self._session_is_reachable(worker_stub):
+            worker_stub.rpc_pool.close()
             return None
         self._register_session_locked(worker_stub, resolved_path)
         logger.info(
@@ -930,6 +948,7 @@ class IdalibSupervisor:
             owned=True,
             pid=worker.process.pid if worker.process is not None else None,
             last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
+            rpc_pool=worker.rpc_pool,
         )
         with self._lock:
             existing = self.path_to_session.get(self._path_key(resolved))
@@ -1023,6 +1042,7 @@ class IdalibSupervisor:
             owned=True,
             pid=worker.process.pid if worker.process is not None else None,
             last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
+            rpc_pool=worker.rpc_pool,
         )
         with self._lock:
             current = self.sessions.get(session.session_id)
