@@ -221,6 +221,14 @@ _Note_: The `idalib` feature was contributed by [Willi Ballenthin](https://githu
 
 Every tool call must carry an explicit `database` argument. There is no implicit "current database" — callers name the session they want to operate on.
 
+Internal supervisor-to-worker RPCs reuse up to two HTTP/1.1 connections per worker.
+Each request exclusively leases a connection; pool acquisition waits at most 10 seconds
+(or the shorter request timeout). Connections idle for 15 seconds are discarded on
+their next checkout. Session replacement, detach and supervisor shutdown close idle
+connections and discard active connections when their requests finish. Existing RPC
+socket timeouts still apply. Failed requests are never automatically replayed, since
+a tool may have changed the database before its response was lost.
+
 ```sh
 uv run idalib-mcp --stdio --max-workers 4
 ```
