@@ -1,5 +1,6 @@
-from itertools import islice
+import json
 import struct
+from itertools import islice
 from typing import Annotated, Any, NotRequired, Optional, TypedDict
 import ida_lines
 import ida_funcs
@@ -14,7 +15,7 @@ import ida_kernwin
 import ida_xref
 import ida_ua
 import ida_name
-from .rpc import tool
+from .rpc import OUTPUT_LIMIT_MAX_CHARS, tool
 from .sync import idasync, tool_timeout, IDAError
 from .utils import (
     parse_address,
@@ -49,17 +50,22 @@ from .utils import (
 from . import compat
 
 
-class DecompileResult(TypedDict):
-    addr: str
-    code: str | None
-    refs: NotRequired[list[Ref]]
-    error: NotRequired[str]
-
-
 class ResultCursor(TypedDict, total=False):
     next: int
     done: bool
     cancelled: bool
+
+
+class DecompileResult(TypedDict):
+    addr: str
+    code: str | None
+    line_count: NotRequired[int]
+    total_lines: NotRequired[int]
+    truncated: NotRequired[bool]
+    cursor: NotRequired[ResultCursor]
+    refs: NotRequired[list[Ref]]
+    refs_truncated: NotRequired[bool]
+    error: NotRequired[str]
 
 
 class DisasmResult(TypedDict, total=False):
@@ -369,6 +375,25 @@ def _operand_value(insn: ida_ua.insn_t, i: int) -> int | None:
     return op.value
 
 
+def _operand_matches(insn: ida_ua.insn_t, i: int, value: int) -> bool:
+    op_val = _operand_value(insn, i)
+    if op_val is None:
+        return False
+    if op_val == value:
+        return True
+    op = insn.ops[i]
+    if op.type != ida_ua.o_imm:
+        return False
+    # IDA sign-extends immediates to 64 bits (`mov eax, 80000000h` has value
+    # 0xFFFFFFFF80000000), so compare at the operand's own width and accept
+    # either the signed or the unsigned spelling of the value.
+    bits = ida_ua.get_dtype_size(op.dtype) * 8
+    if not 8 <= bits <= 64 or not -(1 << (bits - 1)) <= value < (1 << bits):
+        return False
+    mask = (1 << bits) - 1
+    return (op_val & mask) == (value & mask)
+
+
 def _operand_type(insn: ida_ua.insn_t, i: int) -> int:
     return insn.ops[i].type
 
@@ -408,7 +433,7 @@ def _value_candidates_for_immediate(value: int) -> list[tuple[int, int, bytes]]:
     def add(size: int, signed_val: int):
         if size == 4:
             masked = signed_val & 0xFFFFFFFF
-            if not (-0x80000000 <= signed_val <= 0x7FFFFFFF):
+            if not (-0x80000000 <= signed_val <= 0xFFFFFFFF):
                 return
             b = struct.pack("<I", masked)
         else:
@@ -418,6 +443,10 @@ def _value_candidates_for_immediate(value: int) -> list[tuple[int, int, bytes]]:
             b = struct.pack("<Q", masked)
         candidates.append((masked, size, b))
 
+    # IDA reports -0xB0 as 0xFFFFFFFFFFFFFF50. Fold that back to the negative
+    # value so the 4-byte encoding is searched as well.
+    if 1 << 63 <= value < 1 << 64:
+        value -= 1 << 64
     add(4, value)
     add(8, value)
     return candidates
@@ -427,10 +456,17 @@ def _resolve_immediate_insn_start(
     match_ea: int,
     value: int,
     seg_start: int,
-    alt_value: int | None = None,
 ) -> int | None:
-    start_min = max(seg_start, match_ea - _IMM_SCAN_BACK_MAX)
-    for start in range(match_ea, start_min - 1, -1):
+    head = ida_bytes.get_item_head(match_ea)
+    if ida_bytes.is_code(ida_bytes.get_flags(head)):
+        # Use IDA's instruction. Scanning back byte by byte can stop inside a
+        # longer one: 41 B9 10 00 00 00 (mov r9d, 10h) also decodes as
+        # mov ecx, 10h one byte in.
+        starts = [head]
+    else:
+        start_min = max(seg_start, match_ea - _IMM_SCAN_BACK_MAX)
+        starts = range(match_ea, start_min - 1, -1)
+    for start in starts:
         insn = _decode_insn_at(start)
         if insn is None:
             continue
@@ -443,10 +479,7 @@ def _resolve_immediate_insn_start(
                 break
             if op_type != ida_ua.o_imm:
                 continue
-            op_val = _operand_value(insn, i)
-            if op_val is None:
-                continue
-            if op_val == value or (alt_value is not None and op_val == alt_value):
+            if _operand_matches(insn, i, value):
                 offb = getattr(insn.ops[i], "offb", 0)
                 if offb and start + offb != match_ea:
                     continue
@@ -541,11 +574,11 @@ def _resolve_ref_name(ea: int) -> str:
 _STR_CODECS = {0: "utf-8", 1: "utf-16-le", 2: "utf-32-le"}
 
 
-def _resolve_ref(ea: int) -> dict | None:
+def _resolve_ref(ea: int) -> Ref | None:
     name = _resolve_ref_name(ea)
     if not name:
         return None
-    info: dict = {"addr": hex(ea), "name": name}
+    info: Ref = {"addr": hex(ea), "name": name}
     flags = ida_bytes.get_flags(ea)
     if ida_bytes.is_strlit(flags):
         strtype = ida_nalt.get_str_type(ea)
@@ -561,11 +594,11 @@ def _resolve_ref(ea: int) -> dict | None:
     return info
 
 
-def _collect_decompile_refs(cfunc) -> list[dict]:
+def _collect_decompile_refs(cfunc) -> list[Ref]:
     import ida_hexrays
 
     seen: set[int] = set()
-    refs: list[dict] = []
+    refs: list[Ref] = []
 
     class _Visitor(ida_hexrays.ctree_visitor_t):
         def __init__(self):
@@ -585,9 +618,9 @@ def _collect_decompile_refs(cfunc) -> list[dict]:
     return refs
 
 
-def _collect_line_refs(ea: int) -> list[dict]:
+def _collect_line_refs(ea: int) -> list[Ref]:
     seen: set[int] = set()
-    refs: list[dict] = []
+    refs: list[Ref] = []
     for ref_ea in idautils.CodeRefsFrom(ea, False):
         if ref_ea == idaapi.BADADDR or ref_ea in seen:
             continue
@@ -749,6 +782,58 @@ def _profile_function(
 # Code Analysis & Decompilation
 # ============================================================================
 
+_DECOMPILE_CODE_MAX_CHARS = 30_000
+_DECOMPILE_RESULT_MAX_CHARS = OUTPUT_LIMIT_MAX_CHARS - 5_000
+
+
+def _paginate_decompile_code(
+    code: str, offset: int, max_lines: int
+) -> tuple[str, int, int, bool]:
+    """Return a line page whose JSON-encoded code fits the output budget."""
+    lines = code.split("\n")
+    total_lines = len(lines)
+    available = lines[offset : offset + max_lines]
+    page: list[str] = []
+    # json.dumps("") is two quote characters. Embedded newlines encode as "\\n".
+    encoded_chars = 2
+
+    for line in available:
+        addition = len(json.dumps(line)) - 2
+        if page:
+            addition += 2
+        if page and encoded_chars + addition > _DECOMPILE_CODE_MAX_CHARS:
+            break
+        page.append(line)
+        encoded_chars += addition
+
+    line_count = len(page)
+    more = offset + line_count < total_lines
+    return "\n".join(page), line_count, total_lines, more
+
+
+def _attach_decompile_refs(result: DecompileResult, refs: list[Ref]) -> None:
+    """Attach as many refs as fit without pushing the result into RPC truncation."""
+    if not refs:
+        return
+
+    candidate = dict(result)
+    candidate["refs"] = []
+    # Reserve the marker before sizing so adding it cannot cross the budget.
+    candidate["refs_truncated"] = True
+    encoded_chars = len(json.dumps(candidate))
+    retained: list[Ref] = []
+
+    for ref in refs:
+        addition = len(json.dumps(ref)) + (2 if retained else 0)
+        if encoded_chars + addition > _DECOMPILE_RESULT_MAX_CHARS:
+            result["refs_truncated"] = True
+            break
+        retained.append(ref)
+        encoded_chars += addition
+
+    if retained:
+        result["refs"] = retained
+
 
 @tool
 @idasync
@@ -758,28 +843,63 @@ def decompile(
     include_addresses: Annotated[
         bool, "Append /*0xNNNN*/ markers per line (default: true). Set false to save tokens."
     ] = True,
+    max_lines: Annotated[
+        int,
+        "Max pseudocode lines per page (default: 500, max: 5000); "
+        "pages may be smaller to stay under the output cap",
+    ] = 500,
+    offset: Annotated[int, "Skip first N pseudocode lines (default: 0)"] = 0,
 ) -> DecompileResult:
-    """Decompile function(s) at address(es); returns pseudocode and per-item errors."""
+    """Decompile a function. Follow cursor.next for more code; refs appear on the first page."""
+    if max_lines <= 0 or max_lines > 5000:
+        max_lines = 5000
+    if offset < 0:
+        offset = 0
+
     try:
         start = parse_address(addr)
         code, err = decompile_function_safe(start, include_addresses=include_addresses)
         if code is None:
-            return {"addr": addr, "code": None, "error": err or "Decompilation failed"}
-        result: DecompileResult = {"addr": addr, "code": code}
-        try:
-            import ida_hexrays
+            return {
+                "addr": addr,
+                "code": None,
+                "error": err or "Decompilation failed",
+                "cursor": {"done": True},
+            }
 
-            if ida_hexrays.init_hexrays_plugin():
-                cfunc = ida_hexrays.decompile(start)
-                if cfunc:
-                    refs = _collect_decompile_refs(cfunc)
-                    if refs:
-                        result["refs"] = refs
-        except Exception:
-            pass
+        page, line_count, total_lines, more = _paginate_decompile_code(
+            code, offset, max_lines
+        )
+
+        result: DecompileResult = {
+            "addr": addr,
+            "code": page,
+            "line_count": line_count,
+            "total_lines": total_lines,
+            "truncated": offset > 0 or more,
+            "cursor": {"next": offset + line_count} if more else {"done": True},
+        }
+
+        # Refs only on the first page to keep later pages under the RPC size envelope.
+        if offset == 0:
+            try:
+                import ida_hexrays
+
+                if ida_hexrays.init_hexrays_plugin():
+                    cfunc = ida_hexrays.decompile(start)
+                    if cfunc:
+                        refs = _collect_decompile_refs(cfunc)
+                        _attach_decompile_refs(result, refs)
+            except Exception:
+                pass
         return result
     except Exception as e:
-        return {"addr": addr, "code": None, "error": str(e)}
+        return {
+            "addr": addr,
+            "code": None,
+            "error": str(e),
+            "cursor": {"done": True},
+        }
 
 
 @tool
@@ -1879,7 +1999,7 @@ def find(
                     seg = idaapi.getseg(seg_ea)
                     if not seg or not (seg.perm & idaapi.SEGPERM_EXEC):
                         continue
-                    for normalized, size, pattern_bytes in candidates:
+                    for _, size, pattern_bytes in candidates:
                         ea = seg.start_ea
                         while ea != idaapi.BADADDR and ea < seg.end_ea:
                             ea = _raw_bin_search(
@@ -1889,7 +2009,7 @@ def find(
                                 break
 
                             insn_start = _resolve_immediate_insn_start(
-                                ea, value, seg.start_ea, normalized
+                                ea, value, seg.start_ea
                             )
                             if insn_start is not None and insn_start not in seen_insn:
                                 seen_insn.add(insn_start)
@@ -2122,11 +2242,11 @@ def _scan_insn_ranges(
                 continue
 
             match = True
-            if op0_val is not None and _operand_value(insn, 0) != op0_val:
+            if op0_val is not None and not _operand_matches(insn, 0, op0_val):
                 match = False
-            if op1_val is not None and _operand_value(insn, 1) != op1_val:
+            if op1_val is not None and not _operand_matches(insn, 1, op1_val):
                 match = False
-            if op2_val is not None and _operand_value(insn, 2) != op2_val:
+            if op2_val is not None and not _operand_matches(insn, 2, op2_val):
                 match = False
 
             if any_val is not None and match:
@@ -2134,7 +2254,7 @@ def _scan_insn_ranges(
                 for i in range(8):
                     if _operand_type(insn, i) == ida_ua.o_void:
                         break
-                    if _operand_value(insn, i) == any_val:
+                    if _operand_matches(insn, i, any_val):
                         found_any = True
                         break
                 if not found_any:
@@ -2429,13 +2549,15 @@ def callgraph(
                 for item_ea in idautils.FuncItems(f.start_ea):
                     if truncated:
                         break
-                    for xref in idautils.CodeRefsFrom(item_ea, 0):
+                    for xref in idautils.XrefsFrom(item_ea, 0):
+                        if not xref.iscode or xref.type not in (ida_xref.fl_CN, ida_xref.fl_CF):
+                            continue
                         if truncated:
                             break
                         if edges_added >= max_edges_per_func:
                             per_func_capped = True
                             break
-                        callee_func = idaapi.get_func(xref)
+                        callee_func = idaapi.get_func(xref.to)
                         if callee_func:
                             if len(edges) >= max_edges:
                                 hit_limit("edges")
