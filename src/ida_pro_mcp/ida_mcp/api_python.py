@@ -142,6 +142,7 @@ def py_eval(
         sys.stderr = stderr_capture
 
         exec_globals = _make_exec_globals()
+        baseline = dict(exec_globals)
         if new_locals:
             _persisted_locals.clear()
         exec_globals.update(_persisted_locals)
@@ -149,13 +150,24 @@ def py_eval(
         result_value = None
         exec_locals = _persisted_locals
 
+        def _persist():
+            # Code runs in ONE namespace, like a module: with separate globals
+            # and locals, top-level names land in locals, which comprehensions,
+            # lambdas and nested functions cannot see (they resolve free names
+            # through globals), so `n = 1; [n for _ in "x"]` raised NameError.
+            # Carry user-defined or rebound names into the persisted locals.
+            for key, value in exec_globals.items():
+                if key == "__builtins__" or (key in baseline and baseline[key] is value):
+                    continue
+                _persisted_locals[key] = value
+
         # Parse code with AST to properly handle execution
         try:
             tree = ast.parse(code)
         except SyntaxError:
             # If parsing fails, fall back to direct exec
-            exec(code, exec_globals, exec_locals)
-            exec_globals.update(exec_locals)
+            exec(code, exec_globals)
+            _persist()
             if "result" in exec_locals:
                 result_value = str(exec_locals["result"])
             elif exec_locals:
@@ -173,12 +185,8 @@ def py_eval(
                 # Execute all statements except the last
                 if len(tree.body) > 1:
                     exec_tree = ast.Module(body=tree.body[:-1], type_ignores=[])
-                    exec(
-                        compile(exec_tree, "<string>", "exec"),
-                        exec_globals,
-                        exec_locals,
-                    )
-                    exec_globals.update(exec_locals)
+                    exec(compile(exec_tree, "<string>", "exec"), exec_globals)
+                    _persist()
                 # Eval only the last expression
                 eval_tree = ast.Expression(body=tree.body[-1].value)
                 result_value = str(
@@ -186,8 +194,8 @@ def py_eval(
                 )
             else:
                 # All statements (no trailing expression)
-                exec(code, exec_globals, exec_locals)
-                exec_globals.update(exec_locals)
+                exec(code, exec_globals)
+                _persist()
                 # Return 'result' variable if explicitly set
                 if "result" in exec_locals:
                     result_value = str(exec_locals["result"])

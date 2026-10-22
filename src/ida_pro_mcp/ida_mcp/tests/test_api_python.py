@@ -73,6 +73,35 @@ def test_py_eval_exception_goes_to_stderr():
 
 
 @test()
+def test_py_eval_comprehension_sees_top_level_names():
+    """Comprehensions, lambdas and nested functions resolve top-level names (module-like scope)."""
+    code = (
+        "out = []\n"
+        "for ea, n in ((1, 'a'), (2, 'b')):\n"
+        "    out += [f'{ea}{n}' for _ in range(1)]\n"
+        "scale = 10\n"
+        "f = lambda v: v * scale\n"
+        "def g(v):\n"
+        "    return f(v) + len(out)\n"
+        "(out, g(1))"
+    )
+    result = py_eval(code, new_locals=True)
+    assert result["stderr"] == ""
+    assert result["result"] == "(['1a', '2b'], 12)"
+
+
+@test()
+def test_py_eval_locals_persist_across_calls():
+    """Names defined in one call stay visible to the next; new_locals=True clears them."""
+    assert py_eval("persisted_value = 41", new_locals=True)["stderr"] == ""
+    result = py_eval("[persisted_value + i for i in (1,)][0]")
+    assert result["stderr"] == ""
+    assert result["result"] == "42"
+    cleared = py_eval("persisted_value", new_locals=True)
+    assert "NameError" in cleared["stderr"]
+
+
+@test()
 def test_py_exec_file_runs_script_and_captures_stdout():
     """py_exec_file executes a script file and captures its stdout."""
     with _tmp_script('print("hello from file")\nresult = 42\n') as path:
